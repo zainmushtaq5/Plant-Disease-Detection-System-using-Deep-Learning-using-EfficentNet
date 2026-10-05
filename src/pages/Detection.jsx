@@ -4,6 +4,37 @@ import WebcamCapture from "../components/features/WebcamCapture";
 import { Camera, AlertCircle, Upload } from "lucide-react";
 import { motion } from "framer-motion";
 
+/** Resize an image File to at most maxPx on the longest side, JPEG quality 0.8.
+ *  Returns a new File so the upload body stays well under Vercel's 4.5 MB limit. */
+const resizeImageFile = (file, maxPx = 1024, quality = 0.8) =>
+  new Promise((resolve) => {
+    const img = new Image();
+    const objectUrl = URL.createObjectURL(file);
+    img.onload = () => {
+      URL.revokeObjectURL(objectUrl);
+      let { width, height } = img;
+      if (width > maxPx || height > maxPx) {
+        if (width >= height) {
+          height = Math.round((height * maxPx) / width);
+          width = maxPx;
+        } else {
+          width = Math.round((width * maxPx) / height);
+          height = maxPx;
+        }
+      }
+      const canvas = document.createElement("canvas");
+      canvas.width = width;
+      canvas.height = height;
+      canvas.getContext("2d").drawImage(img, 0, 0, width, height);
+      canvas.toBlob(
+        (blob) => resolve(new File([blob], file.name, { type: "image/jpeg" })),
+        "image/jpeg",
+        quality
+      );
+    };
+    img.src = objectUrl;
+  });
+
 const Detection = () => {
   const [imageFile, setImageFile] = useState(null);
   const [previewUrl, setPreviewUrl] = useState(null);
@@ -30,10 +61,11 @@ const Detection = () => {
     setIsAnalyzing(true);
 
     try {
+      const resized = await resizeImageFile(imageFile);
       const formData = new FormData();
-      formData.append("file", imageFile);
+      formData.append("file", resized);
 
-      const response = await fetch("http://localhost:5000/predict", {
+      const response = await fetch("/api/predict", {
         method: "POST",
         body: formData,
       });

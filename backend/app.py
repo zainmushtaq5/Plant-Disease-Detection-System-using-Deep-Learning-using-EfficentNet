@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import tensorflow as tf
 from flask import Flask, request, jsonify
@@ -6,8 +7,13 @@ from PIL import Image, ImageOps
 from tensorflow.keras import backend as K
 
 app = Flask(__name__)
+# Keep CORS so local development (localhost:3000 -> localhost:5000) still works.
+# In production the browser calls /api/predict on the same origin, so CORS is a no-op there.
 CORS(app)
 
+# ---------------------------------------------------------------------------
+# Custom metric used during training – required to load the saved model.
+# ---------------------------------------------------------------------------
 def f1_score(y_true, y_pred):
     y_pred = K.round(y_pred)
     tp = K.sum(K.cast(y_true * y_pred, "float32"))
@@ -15,24 +21,22 @@ def f1_score(y_true, y_pred):
     fn = K.sum(K.cast(y_true * (1 - y_pred), "float32"))
     return tp / (tp + 0.5 * (fp + fn) + K.epsilon())
 
-MODEL_PATH = "plant_disease_efficientnet (1).keras"
-model = None
+# ---------------------------------------------------------------------------
+# Model – loaded once at module level so cold-start cost is paid only once.
+# Path is relative to this file so it works regardless of the working directory.
+# ---------------------------------------------------------------------------
+MODEL_PATH = os.path.join(os.path.dirname(__file__), "plant_disease_efficientnet.keras")
 
-def load_model_if_needed():
-    global model
-    if model is None:
-        try:
-            print(f"Loading model from {MODEL_PATH}...")
-            model = tf.keras.models.load_model(
-                MODEL_PATH,
-                custom_objects={"f1_score": f1_score}
-            )
-            print("Model loaded successfully!")
-        except Exception as e:
-            print(f"Error loading model: {e}")
-            return False
-    return True
+print(f"Loading model from {MODEL_PATH}...")
+model = tf.keras.models.load_model(
+    MODEL_PATH,
+    custom_objects={"f1_score": f1_score}
+)
+print("Model loaded successfully!")
 
+# ---------------------------------------------------------------------------
+# Class labels and per-class treatment advice
+# ---------------------------------------------------------------------------
 class_names = [
     'Apple___Apple_scab', 'Apple___Black_rot', 'Apple___Cedar_apple_rust', 'Apple___healthy',
     'Blueberry___healthy', 'Cherry_(including_sour)___Powdery_mildew', 'Cherry_(including_sour)___healthy',
@@ -90,39 +94,44 @@ solutions = [
     "Water and feed properly. Monitor tomato leaves."
 ]
 
+# ---------------------------------------------------------------------------
+# Image preprocessing
+# ---------------------------------------------------------------------------
 def preprocess_image(pil_image):
     pil_image = pil_image.resize((224, 224), Image.LANCZOS)
     img = np.array(pil_image)
-    img = np.expand_dims(img, axis=0) # model expect batch not single photo thats why 
+    img = np.expand_dims(img, axis=0)  # model expects a batch, not a single photo
     img = tf.keras.applications.efficientnet.preprocess_input(img)
     return img
 
-@app.route('/predict', methods=['POST']) # with this it will accept request
+# ---------------------------------------------------------------------------
+# Route – must match the path Vercel passes through.
+# The top-level rewrite "/api/(.*)" does NOT strip the prefix; the service
+# receives the original path, so the route is /api/predict (not /predict).
+# ---------------------------------------------------------------------------
+@app.route('/api/predict', methods=['POST'])
 def predict():
-    if not load_model_if_needed():
-        return jsonify({'error': 'Model not found or failed to load. Please check server logs.'}), 500
-
     if 'file' not in request.files:
         return jsonify({'error': 'No file part'}), 400
-    
+
     file = request.files['file']
     if file.filename == '':
         return jsonify({'error': 'No selected file'}), 400
 
     try:
         image = Image.open(file.stream)
-        image = ImageOps.exif_transpose(image) # fix rotation issue
+        image = ImageOps.exif_transpose(image)  # fix rotation issue
         image = image.convert('RGB')
-        
+
         processed_image = preprocess_image(image)
-        
+
         preds = model.predict(processed_image, verbose=0)
         idx = np.argmax(preds)
         confidence = float(np.max(preds)) * 100
-        
+
         disease_name = class_names[idx]
         solution = solutions[idx]
-        
+
         plant_name = disease_name.split("___")[0].replace("_", " ").strip()
         disease_only = disease_name.split("___")[1].replace("_", " ").strip()
 
@@ -138,6 +147,9 @@ def predict():
         print(f"Prediction Error: {e}")
         return jsonify({'error': str(e)}), 500
 
+# ---------------------------------------------------------------------------
+# Local development entry-point only.
+# Vercel imports 'app' directly; app.run() must NOT be called at import time.
+# ---------------------------------------------------------------------------
 if __name__ == '__main__':
-    load_model_if_needed()
     app.run(debug=True, port=5000)
