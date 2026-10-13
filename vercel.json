@@ -1,4 +1,5 @@
 {
+  "name": "plant-disease-system",
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "services": {
     "app": { "root": ".", "framework": "create-react-app" },

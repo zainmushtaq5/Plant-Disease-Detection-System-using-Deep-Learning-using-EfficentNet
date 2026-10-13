@@ -1,10 +1,10 @@
 import os
+import json
 import numpy as np
 import tensorflow as tf
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from PIL import Image, ImageOps
-from tensorflow.keras import backend as K
 
 app = Flask(__name__)
 # Keep CORS so local development (localhost:3000 -> localhost:5000) still works.
@@ -12,47 +12,30 @@ app = Flask(__name__)
 CORS(app)
 
 # ---------------------------------------------------------------------------
-# Custom metric used during training – required to load the saved model.
+# Inference config – loaded from inference_config.json next to this file.
 # ---------------------------------------------------------------------------
-def f1_score(y_true, y_pred):
-    y_pred = K.round(y_pred)
-    tp = K.sum(K.cast(y_true * y_pred, "float32"))
-    fp = K.sum(K.cast((1 - y_true) * y_pred, "float32"))
-    fn = K.sum(K.cast(y_true * (1 - y_pred), "float32"))
-    return tp / (tp + 0.5 * (fp + fn) + K.epsilon())
+CONFIG_PATH = os.path.join(os.path.dirname(__file__), "inference_config.json")
+with open(CONFIG_PATH, "r") as f:
+    inference_config = json.load(f)
+
+class_names   = inference_config["class_names"]
+TEMPERATURE   = float(inference_config.get("temperature", 1.0))
+THRESHOLD     = float(inference_config.get("threshold", 0.0))
+IMG_SIZE      = tuple(inference_config.get("img_size", [224, 224]))
 
 # ---------------------------------------------------------------------------
 # Model – loaded once at module level so cold-start cost is paid only once.
 # Path is relative to this file so it works regardless of the working directory.
 # ---------------------------------------------------------------------------
-MODEL_PATH = os.path.join(os.path.dirname(__file__), "plant_disease_efficientnet.keras")
+MODEL_PATH = os.path.join(os.path.dirname(__file__), "plant_disease_efficientnet_v2.keras")
 
-print(f"Loading model from {MODEL_PATH}...")
-model = tf.keras.models.load_model(
-    MODEL_PATH,
-    custom_objects={"f1_score": f1_score}
-)
+print(f"Loading Keras model from {MODEL_PATH}...")
+model = tf.keras.models.load_model(MODEL_PATH, compile=False)
 print("Model loaded successfully!")
 
 # ---------------------------------------------------------------------------
-# Class labels and per-class treatment advice
+# Per-class treatment advice (indexed to match class_names)
 # ---------------------------------------------------------------------------
-class_names = [
-    'Apple___Apple_scab', 'Apple___Black_rot', 'Apple___Cedar_apple_rust', 'Apple___healthy',
-    'Blueberry___healthy', 'Cherry_(including_sour)___Powdery_mildew', 'Cherry_(including_sour)___healthy',
-    'Corn_(maize)___Cercospora_leaf_spot_Gray_leaf_spot', 'Corn_(maize)___Common_rust_',
-    'Corn_(maize)___Northern_Leaf_Blight', 'Corn_(maize)___healthy', 'Grape___Black_rot',
-    'Grape___Esca_(Black_Measles)', 'Grape___Leaf_blight_(Isariopsis_Leaf_Spot)', 'Grape___healthy',
-    'Orange___Haunglongbing_(Citrus_greening)', 'Peach___Bacterial_spot', 'Peach___healthy',
-    'Pepper,_bell___Bacterial_spot', 'Pepper,_bell___healthy', 'Potato___Early_blight',
-    'Potato___Late_blight', 'Potato___healthy', 'Raspberry___healthy', 'Soybean___healthy',
-    'Squash___Powdery_mildew', 'Strawberry___Leaf_scorch', 'Strawberry___healthy',
-    'Tomato___Bacterial_spot', 'Tomato___Early_blight', 'Tomato___Late_blight', 'Tomato___Leaf_Mold',
-    'Tomato___Septoria_leaf_spot', 'Tomato___Spider_mites_Two-spotted_spider_mite',
-    'Tomato___Target_Spot', 'Tomato___Tomato_Yellow_Leaf_Curl_Virus', 'Tomato___Tomato_mosaic_virus',
-    'Tomato___healthy'
-]
-
 solutions = [
     "Remove infected leaves. Spray fungicide once a week.",
     "Pick rotten apples. Spray medicine to stop spread.",
@@ -96,13 +79,21 @@ solutions = [
 
 # ---------------------------------------------------------------------------
 # Image preprocessing
+# Per inference_config: inputs are RGB floats in 0..255;
+# apply softmax(logits / temperature) after model outputs logits.
 # ---------------------------------------------------------------------------
 def preprocess_image(pil_image):
-    pil_image = pil_image.resize((224, 224), Image.LANCZOS)
-    img = np.array(pil_image)
-    img = np.expand_dims(img, axis=0)  # model expects a batch, not a single photo
-    img = tf.keras.applications.efficientnet.preprocess_input(img)
+    """Resize to model input size and convert to float32 batch."""
+    pil_image = pil_image.resize(IMG_SIZE, Image.LANCZOS)
+    img = np.array(pil_image, dtype=np.float32)          # [H, W, 3] in 0–255
+    img = np.expand_dims(img, axis=0)                    # [1, H, W, 3]
     return img
+
+def softmax_with_temperature(logits, temperature=1.0):
+    """Apply temperature scaling then softmax."""
+    scaled = logits / temperature
+    e = np.exp(scaled - np.max(scaled))                  # numerically stable
+    return e / e.sum()
 
 # ---------------------------------------------------------------------------
 # Route – must match the path Vercel passes through.
@@ -120,26 +111,31 @@ def predict():
 
     try:
         image = Image.open(file.stream)
-        image = ImageOps.exif_transpose(image)  # fix rotation issue
+        image = ImageOps.exif_transpose(image)   # fix rotation
         image = image.convert('RGB')
 
         processed_image = preprocess_image(image)
 
-        preds = model.predict(processed_image, verbose=0)
-        idx = np.argmax(preds)
-        confidence = float(np.max(preds)) * 100
+        # Run inference – model may output logits or probabilities
+        raw_output = model.predict(processed_image, verbose=0)[0]
+
+        # Apply temperature-scaled softmax as specified by inference_config
+        probs = softmax_with_temperature(raw_output, TEMPERATURE)
+
+        idx        = int(np.argmax(probs))
+        confidence = float(probs[idx]) * 100
 
         disease_name = class_names[idx]
-        solution = solutions[idx]
+        solution     = solutions[idx] if idx < len(solutions) else "Consult an agronomist."
 
-        plant_name = disease_name.split("___")[0].replace("_", " ").strip()
+        plant_name   = disease_name.split("___")[0].replace("_", " ").strip()
         disease_only = disease_name.split("___")[1].replace("_", " ").strip()
 
         return jsonify({
-            'disease': disease_only,
-            'plant': plant_name,
-            'confidence': confidence,
-            'solution': solution,
+            'disease':        disease_only,
+            'plant':          plant_name,
+            'confidence':     confidence,
+            'solution':       solution,
             'full_class_name': disease_name
         })
 

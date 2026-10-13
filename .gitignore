@@ -25,3 +25,10 @@ dist-ssr/
 *.sw?
 
 backend/tf_env/
+.vercel
+
+# Local wheel files (not needed in repo)
+*.whl
+
+# Jupyter notebooks (training artifacts)
+*.ipynb
